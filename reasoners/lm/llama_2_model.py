@@ -1,6 +1,3 @@
-# revised from https://github.com/facebookresearch/llama/blob/main/llama/generation.py
-
-
 import json
 import os
 import sys
@@ -19,6 +16,7 @@ from fairscale.nn.model_parallel.initialize import (
     get_model_parallel_rank,
 )
 from llama import ModelArgs, Transformer, Tokenizer
+from safetensors import safe_open
 
 from reasoners import LanguageModel, GenerateOutput
 
@@ -34,7 +32,7 @@ class Llama2Model(LanguageModel):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
         if not model_parallel_is_initialized():
-            if model_parallel_size is None:# add WORLD_SIZE to env
+            if model_parallel_size is None:  # add WORLD_SIZE to env
                 model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
 
@@ -48,13 +46,17 @@ class Llama2Model(LanguageModel):
             sys.stdout = open(os.devnull, "w")
 
         start_time = time.time()
-        checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
+        checkpoints = sorted(Path(ckpt_dir).glob("*.safetensors"))
         assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
         assert model_parallel_size == len(
             checkpoints
         ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
         ckpt_path = checkpoints[get_model_parallel_rank()]
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        
+        # Load safetensors checkpoint
+        with safe_open(ckpt_path, framework="pt", device="cpu") as f:
+            checkpoint = {key: f.get_tensor(key) for key in f.keys()}
+
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
 
@@ -77,7 +79,7 @@ class Llama2Model(LanguageModel):
         print(os.path.join(path, f"llama-2-{size.lower()}"))
         print(os.path.join(path, "tokenizer.model"))
         self.model, self.tokenizer = self.build(os.path.join(path, f"llama-2-{size.lower()}"), os.path.join(path, "tokenizer.model"),
-                                                max_seq_len=max_seq_len, max_batch_size=max_batch_size,**kwargs)
+                                                max_seq_len=max_seq_len, max_batch_size=max_batch_size, **kwargs)
         self.max_seq_len = max_seq_len
         self.local_rank = int(os.environ.get("LOCAL_RANK", -1))
 
@@ -96,7 +98,6 @@ class Llama2Model(LanguageModel):
                  output_log_probs: bool = False,
                  **kwargs) -> GenerateOutput:
         
-                                                
         if max_length is None:
             max_length = min(self.max_seq_len, self.model.params.max_seq_len -1)  # use LLaMA's max length if not set
         if max_new_tokens is None:
@@ -104,7 +105,7 @@ class Llama2Model(LanguageModel):
 
         if not do_sample:
             if temperature != 1.0 and self.local_rank == 0:  # temperature is explicitly set with do_sample=False 
-                warnings.warn('temperature is set, but do_sample=False, so temperature will be ignored.')#if this feature for you is important, you can change the warning to error
+                warnings.warn('temperature is set, but do_sample=False, so temperature will be ignored.')
             temperature = 0
         
         # unify eos_token
@@ -119,7 +120,7 @@ class Llama2Model(LanguageModel):
                     if len(tokenized) != 1 and self.local_rank == 0:
                         warnings.warn(f'the eos_token {repr(token)} is encoded into {tokenized} with length != 1, '
                                       f'using {tokenized[-1]} as the eos_token_id')
-                    token = tokenized[-1] #this feature can be changed to eos window if user really want a special word be as eos
+                    token = tokenized[-1]
                 if isinstance(token, int):
                     eos_token_id.append(token)
                 elif self.local_rank == 0:
@@ -144,7 +145,6 @@ class Llama2Model(LanguageModel):
         max_prompt_size = max([len(t) for t in prompt_tokens])
 
         assert max_prompt_size <= params.max_seq_len, f"prompt length exceeds limit: {max_prompt_size} > {params.max_seq_len}"
-        #from max_length and max_new_tokens, we choose the shorter one as the total length
         total_len = min(params.max_seq_len, max_length)
         total_len = min(total_len, max_prompt_size + max_new_tokens) 
 
@@ -164,7 +164,7 @@ class Llama2Model(LanguageModel):
         for cur_pos in range(start_pos, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
-                probs = torch.softmax(logits[:,-1]/ temperature , dim=-1)# here is a modification on slice
+                probs = torch.softmax(logits[:,-1]/ temperature , dim=-1)
                 next_token = self.sample_top_pk(probs, top_p, top_k)
             else:
                 probs = torch.softmax(logits[:,-1], dim=-1)
@@ -222,7 +222,7 @@ class Llama2Model(LanguageModel):
                 token = self.tokenizer.encode(cand, bos=False, eos=False)
                 if len(token) != 1:
                     warnings.warn(f'candidate {cand} corresponds to {len(token)} instead of 1')
-                cand_tokens[-1].append(token[1] if token[0] == 29871 else token[0])###?29871 I prefer to change this, same in llama1
+                cand_tokens[-1].append(token[1] if token[0] == 29871 else token[0])
 
         bsz = len(prompt)
         params = self.model.params
